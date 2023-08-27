@@ -13,7 +13,8 @@ let package = Package(
             targets: ["CooperativeSynchronization"]),
     ],
     dependencies: [
-        .package(path: "../CoreExtensions")
+        .package(path: "../CoreExtensions"),
+        .package(path: "../Synchronization"),
     ],
     targets: [
         .target(
@@ -21,6 +22,7 @@ let package = Package(
             dependencies: [
                 .product(name: "AsyncExtensions", package: "CoreExtensions"),
                 .product(name: "CollectionExtensions", package: "CoreExtensions"),
+                .product(name: "Synchronization", package: "Synchronization"),
             ]),
         .testTarget(
             name: "CooperativeSynchronizationTests",
