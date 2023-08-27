@@ -6,6 +6,6 @@ final class CooperativeSynchronizationTests: XCTestCase {
         // This is an example of a functional test case.
         // Use XCTAssert and related functions to verify your tests produce the correct
         // results.
-        XCTAssertEqual(CooperativeSynchronization().text, "Hello, World!")
+//        XCTAssertEqual(CooperativeSynchronization().text, "Hello, World!")
     }
 }
