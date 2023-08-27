@@ -26,6 +26,9 @@ let package = Package(
             ]),
         .testTarget(
             name: "CooperativeSynchronizationTests",
-            dependencies: ["CooperativeSynchronization"]),
+            dependencies: [
+                "CooperativeSynchronization",
+                .product(name: "AsyncExtensions", package: "CoreExtensions"),
+            ]),
     ]
 )

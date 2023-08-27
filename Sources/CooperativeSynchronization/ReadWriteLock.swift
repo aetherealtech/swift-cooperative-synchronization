@@ -2,6 +2,11 @@ import Foundation
 
 fileprivate protocol Waiter: Identifiable where ID == UUID {
     var continuation: CheckedContinuation<Void, Error> { get }
+    
+    init(
+        id: UUID,
+        continuation: CheckedContinuation<Void, Error>
+    )
 }
 
 extension RangeReplaceableCollection where Element == any Waiter {
@@ -16,59 +21,31 @@ public actor ReadWriteLock {
     }
     
     public func lock() async throws {
-        if readers == maxReaders || writing {
-            let id = UUID()
-            
-            try await withTaskCancellationHandler(
-                operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        waiters.append(Reader(
-                            id: id,
-                            continuation: continuation
-                        ))
-                    }
-                },
-                onCancel: {
-                    Task { await cancel(id: id) }
-                }
-            )
-        }
-        
-        readers += 1
+        try await lock(
+            ready: readers < maxReaders && !writing,
+            acquire: { readers += 1 },
+            waiterType: Reader.self
+        )
     }
     
     public func unlock() {
-        readers -= 1
+        if writing {
+            writing = false
+        } else {
+            readers -= 1
+        }
+        
         notify()
     }
     
     public func exclusiveLock() async throws {
-        if readers > 0 || writing {
-            let id = UUID()
-            
-            try await withTaskCancellationHandler(
-                operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        waiters.append(Writer(
-                            id: id,
-                            continuation: continuation
-                        ))
-                    }
-                },
-                onCancel: {
-                    Task { await cancel(id: id) }
-                }
-            )
-        }
-        
-        writing = true
+        try await lock(
+            ready: readers == 0 && !writing,
+            acquire: { writing = true },
+            waiterType: Writer.self
+        )
     }
-    
-    public func exclusiveUnlock() {
-        writing = false
-        notify()
-    }
-    
+
     private struct Reader: Waiter {
         let id: UUID
         let continuation: CheckedContinuation<Void, Error>
@@ -86,9 +63,43 @@ public actor ReadWriteLock {
 
     private var waiters: [any Waiter] = []
     
+    private func lock<W: Waiter>(
+        ready: Bool,
+        acquire: () -> Void,
+        waiterType: W.Type
+    ) async throws {
+        if !ready || !waiters.of(type: Writer.self).isEmpty {
+            let id = UUID()
+            
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { continuation in
+                        waiters.append(W.init(
+                            id: id,
+                            continuation: continuation
+                        ))
+                    }
+                },
+                onCancel: {
+                    Task { await cancel(id: id) }
+                }
+            )
+        } else {
+            acquire()
+        }
+    }
+    
     private func notify() {
-        while !waiters.isEmpty, !writing && readers < maxReaders {
-            let waiter = waiters.removeFirst()
+        while let waiter = waiters.first {
+            if waiter is Writer {
+                guard !writing && readers == 0 else { break }
+                writing = true
+            } else {
+                guard !writing && readers < maxReaders else { break }
+                readers += 1
+            }
+            
+            waiters.removeFirst()
             waiter.continuation.resume()
         }
     }
@@ -110,7 +121,7 @@ public extension ReadWriteLock {
     
     func write<R>(_ work: () async throws -> R) async throws -> R {
         try await exclusiveLock()
-        defer { exclusiveUnlock() }
+        defer { unlock() }
         
         return try await work()
     }
@@ -131,7 +142,7 @@ public struct ExclusiveLock: Lockable {
     let lock: ReadWriteLock
     
     public func lock() async throws { try await lock.exclusiveLock() }
-    public func unlock() async { await lock.exclusiveUnlock() }
+    public func unlock() async { await lock.unlock() }
     
     public func lock<R>(_ work: () async throws -> R) async throws -> R {
         try await lock.write(work)
