@@ -65,17 +65,15 @@ public final class SerialQueue: Scheduler {
     private var state: State = .init()
 
     private let runner: Task<Void, Error>
+    private let lock = Lock()
+    private let condition = ConditionVariable()
 
     public init() {
         runner = Task(operation: _state.run)
     }
 
     deinit {
-        runner.cancel()
-
-        _state.write { state in
-            state.cancelAll()
-        }
+        cancelAll()
     }
     
     public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
@@ -110,9 +108,9 @@ extension Synchronization.Synchronized where T == SerialQueue.State {
                     
                     let task = IdentifiableTask(id: job.id, task: Task { await job.work() })
                     state.mode = .running(task)
+                    
+                    continuation.resume(returning: task)
                 }
-                
-                continuation.resume(returning: task)
             }
             
             await task.task.value
