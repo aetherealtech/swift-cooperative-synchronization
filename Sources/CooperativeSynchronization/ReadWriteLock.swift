@@ -11,8 +11,12 @@ extension RangeReplaceableCollection where Element == any Waiter {
 }
 
 public actor ReadWriteLock {
+    public init(maxReaders: Int = .max) {
+        self.maxReaders = maxReaders
+    }
+    
     public func lock() async throws {
-        if writing {
+        if readers == maxReaders || writing {
             let id = UUID()
             
             try await withTaskCancellationHandler(
@@ -35,11 +39,7 @@ public actor ReadWriteLock {
     
     public func unlock() {
         readers -= 1
-        
-        if readers == 0, let waiter = waiters.first as? Writer {
-            waiters.removeFirst()
-            waiter.continuation.resume()
-        }
+        notify()
     }
     
     public func exclusiveLock() async throws {
@@ -66,12 +66,7 @@ public actor ReadWriteLock {
     
     public func exclusiveUnlock() {
         writing = false
-        
-        while !waiters.isEmpty {
-            let waiter = waiters.removeFirst()
-            waiter.continuation.resume()
-            if waiter is Writer { break }
-        }
+        notify()
     }
     
     private struct Reader: Waiter {
@@ -84,10 +79,19 @@ public actor ReadWriteLock {
         let continuation: CheckedContinuation<Void, Error>
     }
     
+    private let maxReaders: Int
+    
     private var readers = 0
     private var writing = false
 
     private var waiters: [any Waiter] = []
+    
+    private func notify() {
+        while !waiters.isEmpty, !writing && readers < maxReaders {
+            let waiter = waiters.removeFirst()
+            waiter.continuation.resume()
+        }
+    }
     
     private func cancel(id: UUID) {
         if let continuation = waiters.remove(id: id) {
