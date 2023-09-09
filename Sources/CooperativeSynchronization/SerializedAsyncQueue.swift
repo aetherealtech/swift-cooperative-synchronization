@@ -7,7 +7,7 @@ import Foundation
  Unlike AsyncQueue, SerializedAsyncQueue is not an AsyncSequence, and thus cannot be for awaited... over.  This is because it is only safe to remove an item from the serialized copy of the queue after an item is successfully processed.  A special API is provided to allow asynchronous processing that ensures an item is only removed once processing of that item completes successfully.  That way, if the app is terminated in the middle of processing an item, then that item will still exist as the first item in the queue on a new app session.
  */
 
-public actor SerializedAsyncQueue<Element: Codable, Decoder: TopLevelDecoder, Encoder: TopLevelEncoder> where Decoder.Input == Data, Encoder.Output == Data {
+public actor SerializedAsyncQueue<Element: Codable & Sendable, Decoder: TopLevelDecoder, Encoder: TopLevelEncoder> where Decoder.Input == Data, Encoder.Output == Data {
     public var currentElements: [Element] {
         loadQueue
             .map(\.element)
@@ -28,7 +28,7 @@ public actor SerializedAsyncQueue<Element: Codable, Decoder: TopLevelDecoder, En
         self.onEncodeError = onEncodeError
     }
 
-    public func process(_ handler: @escaping (Element) async -> Void) async {
+    public func process(_ handler: @escaping @Sendable (Element) async -> Void) async {
         while true {
             let value = await withCheckedContinuation { incomingContinuation in
                 let values = loadQueue
@@ -75,7 +75,7 @@ public actor SerializedAsyncQueue<Element: Codable, Decoder: TopLevelDecoder, En
         currentTask = nil
     }
     
-    private struct QueuedElement: Codable, Equatable {
+    private struct QueuedElement: Codable, Equatable, Sendable {
         let id: UUID
         let element: Element
 
@@ -96,7 +96,7 @@ public actor SerializedAsyncQueue<Element: Codable, Decoder: TopLevelDecoder, En
     private let onDecodeError: (Error) -> Void
     private let onEncodeError: (Error) -> Void
 
-    private var continuation: (CheckedContinuation<QueuedElement, Never>, (Element) async -> Void)?
+    private var continuation: (CheckedContinuation<QueuedElement, Never>, @Sendable (Element) async -> Void)?
     private var currentTask: Task<Void, Never>?
 
     private var loadQueue: [QueuedElement] {

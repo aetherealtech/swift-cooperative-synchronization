@@ -112,14 +112,14 @@ public actor ReadWriteLock {
 }
 
 public extension ReadWriteLock {
-    func read<R>(_ work: () async throws -> R) async throws -> R {
+    func read<R: Sendable>(_ work: @Sendable () async throws -> R) async throws -> R {
         try await lock()
         defer { unlock() }
         
         return try await work()
     }
     
-    func write<R>(_ work: () async throws -> R) async throws -> R {
+    func write<R: Sendable>(_ work: @Sendable () async throws -> R) async throws -> R {
         try await exclusiveLock()
         defer { unlock() }
         
@@ -133,7 +133,7 @@ public struct SharedLock: Lockable {
     public func lock() async throws { try await lock.lock() }
     public func unlock() async { await lock.unlock() }
     
-    public func lock<R>(_ work: () async throws -> R) async throws -> R {
+    public func lock<R: Sendable>(_ work: @Sendable () async throws -> R) async throws -> R {
         try await lock.read(work)
     }
 }
@@ -144,7 +144,7 @@ public struct ExclusiveLock: Lockable {
     public func lock() async throws { try await lock.exclusiveLock() }
     public func unlock() async { await lock.unlock() }
     
-    public func lock<R>(_ work: () async throws -> R) async throws -> R {
+    public func lock<R: Sendable>(_ work: @Sendable () async throws -> R) async throws -> R {
         try await lock.write(work)
     }
 }

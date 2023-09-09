@@ -1,4 +1,4 @@
-public final class CountdownLatch {
+public final class CountdownLatch: @unchecked Sendable {
     public init(value: Int) {
         self.value = value
     }
@@ -9,7 +9,7 @@ public final class CountdownLatch {
         do {
             if value > 0 {
                 try await condition.wait(lock: lock) {
-                    value == 0
+                    value == 0 
                 }
             }
             

@@ -2,7 +2,7 @@ import AsyncExtensions
 import CollectionExtensions
 import Foundation
 
-public final class Event {
+public final class Event: @unchecked Sendable {
     public init() {}
 
     public var signaled: Bool {

@@ -17,59 +17,53 @@ public final class SerialQueue: Scheduler {
         public init() {}
     }
 
-    fileprivate struct State {
-        enum Mode {
-            case idle
-            case waiting(CheckedContinuation<IdentifiableTask, Error>)
-            case running(IdentifiableTask)
-        }
-
-        var mode: Mode = .idle
+    fileprivate final class State: @unchecked Sendable {
+        var current: IdentifiableTask?
         var enqueued: [IdentifiableJob] = []
-
-        mutating func cancelAll() {
-            enqueued.removeAll()
-
-            switch mode {
-                case let .waiting(continuation):
-                    continuation.resume(throwing: CancellationError())
-                case let .running(task):
-                    task.task.cancel()
-                default:
-                    break
+        
+        let lock = Synchronization.Lock()
+        let condition = ConditionVariable()
+        
+        @Sendable
+        func run() async throws {
+            while true {
+                try Task.checkCancellation()
+                
+                let task = try await startNextJob()
+                
+                await task.task.value
             }
         }
+        
+        private func startNextJob() async throws -> IdentifiableTask {
+            lock.lock()
+            defer { lock.unlock() }
+            
+            let job = try await {
+                if let job = enqueued.safelyRemoveFirst() {
+                    return job
+                } else {
+                    try await condition.wait(lock: lock) {
+                        !enqueued.isEmpty
+                    }
+                    
+                    return enqueued.removeFirst()
+                }
+            }()
 
-        mutating func schedule(id: UUID, _ work: @escaping @Sendable () async -> Void) {
-            switch mode {
-                case let .waiting(continuation):
-                    let task = IdentifiableTask(id: id, task: Task { await work() })
-                    mode = .running(task)
-                    continuation.resume(returning: task)
-                default:
-                    let job = IdentifiableJob(id: id, work: work)
-                    enqueued.append(job)
-            }
-        }
-
-        mutating func cancel(id: UUID) {
-            if case let .running(currentTask) = mode, currentTask.id == id {
-                currentTask.task.cancel()
-            } else {
-                enqueued.remove(id: id)
-            }
+            let task = IdentifiableTask(id: job.id, task: Task { await job.work() })
+            current = task
+            
+            return task
         }
     }
 
-    @Synchronization.Synchronized
-    private var state: State = .init()
+    private let state = State()
 
     private let runner: Task<Void, Error>
-    private let lock = Lock()
-    private let condition = ConditionVariable()
 
     public init() {
-        runner = Task(operation: _state.run)
+        runner = Task(operation: state.run)
     }
 
     deinit {
@@ -79,44 +73,36 @@ public final class SerialQueue: Scheduler {
     public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
         let id = UUID()
         
-        _state.write { state in
-            state.schedule(id: id, work)
-        }
+        schedule(id: id, work)
 
-        return .init { [weak _state] in _state?.write { state in state.cancel(id: id) } }
+        return .init { [weak self] in self?.cancel(id: id) }
     }
 
     public func cancelAll() {
-        _state.write { state in
-            state.cancelAll()
+        state.lock.lock {
+            state.current?.task.cancel()
+            state.enqueued.removeAll()
         }
     }
-}
+    
+    func schedule(id: UUID, _ work: @escaping @Sendable () async -> Void) {
+        let job = IdentifiableJob(id: id, work: work)
 
-extension Synchronization.Synchronized where T == SerialQueue.State {
-    @Sendable
-    func run() async throws {
-        while true {
-            try Task.checkCancellation()
-            
-            let task = try await withCheckedThrowingContinuation { continuation in
-                write { state in
-                    guard let job = state.enqueued.safelyRemoveFirst() else {
-                        state.mode = .waiting(continuation)
-                        return
-                    }
-                    
-                    let task = IdentifiableTask(id: job.id, task: Task { await job.work() })
-                    state.mode = .running(task)
-                    
-                    continuation.resume(returning: task)
-                }
-            }
-            
-            await task.task.value
-            
-            write { state in
-                state.mode = .idle
+        state.lock.lock {
+            state.enqueued.append(job)
+        }
+        
+        Task {
+            await state.condition.notifyOne()
+        }
+    }
+
+    func cancel(id: UUID) {
+        state.lock.lock {
+            if state.current?.id == id {
+                state.current?.task.cancel()
+            } else {
+                state.enqueued.remove(id: id)
             }
         }
     }

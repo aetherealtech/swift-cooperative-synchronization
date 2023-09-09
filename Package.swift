@@ -10,7 +10,8 @@ let package = Package(
         // Products define the executables and libraries a package produces, and make them visible to other packages.
         .library(
             name: "CooperativeSynchronization",
-            targets: ["CooperativeSynchronization"]),
+            targets: ["CooperativeSynchronization"]
+        ),
     ],
     dependencies: [
         .package(path: "../CoreExtensions"),
@@ -23,12 +24,32 @@ let package = Package(
                 .product(name: "AsyncExtensions", package: "CoreExtensions"),
                 .product(name: "CollectionExtensions", package: "CoreExtensions"),
                 .product(name: "Synchronization", package: "Synchronization"),
-            ]),
+            ],
+            swiftSettings: [.concurrencyChecking(.complete)]
+        ),
         .testTarget(
             name: "CooperativeSynchronizationTests",
             dependencies: [
                 "CooperativeSynchronization",
                 .product(name: "AsyncExtensions", package: "CoreExtensions"),
-            ]),
+            ],
+            swiftSettings: [.concurrencyChecking(.complete)]
+        ),
     ]
 )
+
+extension SwiftSetting {
+    enum ConcurrencyChecking: String {
+        case complete
+        case minimal
+        case targeted
+    }
+    
+    static func concurrencyChecking(_ setting: ConcurrencyChecking = .minimal) -> Self {
+        unsafeFlags([
+            "-Xfrontend", "-strict-concurrency=\(setting)",
+            "-Xfrontend", "-warn-concurrency",
+            "-Xfrontend", "-enable-actor-data-race-checks",
+        ])
+    }
+}

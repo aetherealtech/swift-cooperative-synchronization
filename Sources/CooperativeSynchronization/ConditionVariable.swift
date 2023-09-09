@@ -1,5 +1,6 @@
 import AsyncExtensions
 import Foundation
+import Synchronization
 
 public struct TimedOut: Error {}
 
@@ -17,6 +18,8 @@ public actor ConditionVariable {
     public func wait(
         lock: some Lockable
     ) async throws {
+        try Task.checkCancellation()
+        
         await lock.unlock()
         
         do {
@@ -45,6 +48,33 @@ public actor ConditionVariable {
         }
     }
     
+    public func wait(
+        lock: Synchronization.Lock
+    ) async throws {
+        try Task.checkCancellation()
+        
+        lock.unlock()
+        defer { lock.lock() }
+        
+        let id = UUID()
+        
+        try await withTaskCancellationHandler(
+            operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    waiters.append(.init(
+                        id: id,
+                        continuation: continuation
+                    ))
+                }
+            },
+            onCancel: {
+                Task {
+                    await cancel(id: id)
+                }
+            }
+        )
+    }
+    
     public func notifyOne() {
         waiters.safelyRemoveFirst()?.resume()
     }
@@ -69,7 +99,16 @@ public actor ConditionVariable {
 public extension ConditionVariable {
     func wait(
         lock: some Lockable,
-        _ condition: () throws -> Bool
+        _ condition: @Sendable () throws -> Bool
+    ) async throws {
+        while try !condition() {
+            try await wait(lock: lock)
+        }
+    }
+    
+    func wait(
+        lock: Synchronization.Lock,
+        _ condition: @Sendable () throws -> Bool
     ) async throws {
         while try !condition() {
             try await wait(lock: lock)

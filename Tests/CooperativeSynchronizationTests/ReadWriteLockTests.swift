@@ -8,7 +8,7 @@ final class ReadWriteLockTests: XCTestCase {
     func testWriter() async throws {
         let lock = ReadWriteLock()
         
-        let read = {
+        let read = { @Sendable in
             try await lock.read {
                 print("READING")
                 try await Task.sleep(timeInterval: 1.0)

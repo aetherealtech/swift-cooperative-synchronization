@@ -7,7 +7,7 @@ public protocol JobConfigProtocol {
     init()
 }
 
-public protocol Scheduler {
+public protocol Scheduler: Sendable {
     associatedtype JobConfig: JobConfigProtocol
     
     @discardableResult
@@ -23,33 +23,54 @@ public extension Scheduler {
     }
 }
 
+private struct ScheduleWaitState<R, Failure: Error> {
+    var continuation: CheckedContinuation<R, Failure>?
+    var task: AnyCancellable?
+    var cancelled = false
+}
+
 public extension Scheduler {
-    func scheduleAndWait<R>(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> R, resultIfCancelled: @autoclosure () -> R) async -> R {
+    func scheduleAndWait<R>(
+        config: JobConfig = .init(),
+        _ work: @escaping @Sendable () async -> R,
+        resultIfCancelled: @autoclosure @Sendable () -> R
+    ) async -> R {
         @Synchronization.Synchronized
-        var continuation: CheckedContinuation<R, Never>? = nil
-        
-        var task: AnyCancellable?
+        var state: ScheduleWaitState<R, Never> = .init()
         
         return await withTaskCancellationHandler(
-            operation: {
-                await withCheckedContinuation { resultContinuation in
-                    continuation = resultContinuation
-                    
-                    task = schedule(config: config) { [_continuation] in
-                        let continuation = _continuation.getAndSet { continuation in
-                            continuation = nil
+            operation: { [_state] in
+                if _state.cancelled {
+                    return resultIfCancelled()
+                }
+
+                return await withCheckedContinuation { resultContinuation in
+                    _state.write { state in
+                        state.continuation = resultContinuation
+                        state.task = schedule(config: config) {
+                            guard let continuation = _state.write({ state in
+                                let continuation = state.continuation
+                                state.continuation = nil
+                                return continuation
+                            }) else {
+                                return
+                            }
+
+                            let result = await work()
+                            continuation.resume(returning: result)
                         }
-                        
-                        continuation?.resume(returning: await work())
                     }
                 }
             },
-            onCancel: { [task, _continuation] in
-                task?.cancel()
-                
-                _continuation.write { continuation in
-                    continuation?.resume(returning: resultIfCancelled())
-                    continuation = nil
+            onCancel: { [_state] in
+                _state.write { state in
+                    state.cancelled = true
+                    state.task?.cancel()
+                    if let continuation = state.continuation {
+                        continuation.resume(returning: resultIfCancelled())
+                    }
+                    
+                    state.continuation = nil
                 }
             }
         )
@@ -65,31 +86,41 @@ public extension Scheduler {
     
     func scheduleAndWait<R>(config: JobConfig = .init(), _ work: @escaping @Sendable () async throws -> R) async throws -> R {
         @Synchronization.Synchronized
-        var continuation: CheckedContinuation<R, Error>? = nil
-        
-        var task: AnyCancellable?
+        var state: ScheduleWaitState<R, Error> = .init()
         
         return try await withTaskCancellationHandler(
-            operation: {
-                try await withCheckedThrowingContinuation { resultContinuation in
-                    continuation = resultContinuation
-                    
-                    task = schedule(config: config) { [_continuation] in
-                        let continuation = _continuation.getAndSet { continuation in
-                            continuation = nil
+            operation: { [_state] in
+                if _state.cancelled {
+                    throw CancellationError()
+                }
+
+                return try await withCheckedThrowingContinuation { resultContinuation in
+                    _state.write { state in
+                        state.continuation = resultContinuation
+                        state.task = schedule(config: config) {
+                            guard let continuation = _state.write({ state in
+                                let continuation = state.continuation
+                                state.continuation = nil
+                                return continuation
+                            }) else {
+                                return
+                            }
+
+                            let result = await Result { try await work() }
+                            continuation.resume(with: result)
                         }
-                        
-                        let result = await Result { try await work() }
-                        continuation?.resume(with: result)
                     }
                 }
             },
-            onCancel: { [task, _continuation] in
-                task?.cancel()
-                
-                _continuation.write { continuation in
-                    continuation?.resume(throwing: CancellationError())
-                    continuation = nil
+            onCancel: { [_state] in
+                _state.write { state in
+                    state.cancelled = true
+                    state.task?.cancel()
+                    if let continuation = state.continuation {
+                        continuation.resume(throwing: CancellationError())
+                    }
+                    
+                    state.continuation = nil
                 }
             }
         )

@@ -117,13 +117,17 @@ public final class ConcurrentQueue: Scheduler {
         }
     }
 
-    @Synchronization.Synchronized
-    private var state: State
+    private let _state: Synchronization.Synchronized<State>
 
+    private var state: State {
+        get { _state.wrappedValue }
+        set { _state.wrappedValue = newValue }
+    }
+    
     public init(maxConcurrency: Int = .max) {
-        state = .init(
+        _state = .init(wrappedValue: .init(
             maxConcurrency: maxConcurrency
-        )
+        ))
     }
 
     deinit {

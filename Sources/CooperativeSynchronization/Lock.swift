@@ -41,7 +41,7 @@ public actor Lock: Lockable {
 }
 
 public extension Lock {
-    func lock<R>(_ work: () async throws -> R) async throws -> R {
+    func lock<R: Sendable>(_ work: @Sendable () async throws -> R) async throws -> R {
         try await lock()
         defer { unlock() }
         
