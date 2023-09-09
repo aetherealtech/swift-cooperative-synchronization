@@ -1,18 +1,17 @@
 import Foundation
+import Synchronization
 
-fileprivate protocol Waiter: Identifiable where ID == UUID {
+fileprivate protocol Waiter {
     var continuation: CheckedContinuation<Void, Error> { get }
     
     init(
-        id: UUID,
         continuation: CheckedContinuation<Void, Error>
     )
 }
 
-extension RangeReplaceableCollection where Element == any Waiter {
-    mutating func remove(id: UUID) -> Element? {
-        removeFirst { $0.id == id }
-    }
+struct WaiterState {
+    var continuation: CheckedContinuation<Void, Error>?
+    var cancelled = false
 }
 
 public actor ReadWriteLock {
@@ -47,12 +46,10 @@ public actor ReadWriteLock {
     }
 
     private struct Reader: Waiter {
-        let id: UUID
         let continuation: CheckedContinuation<Void, Error>
     }
     
     private struct Writer: Waiter {
-        let id: UUID
         let continuation: CheckedContinuation<Void, Error>
     }
     
@@ -69,19 +66,29 @@ public actor ReadWriteLock {
         waiterType: W.Type
     ) async throws {
         if !ready || !waiters.of(type: Writer.self).isEmpty {
-            let id = UUID()
+            @Synchronization.Synchronized
+            var state: WaiterState = .init()
             
             try await withTaskCancellationHandler(
-                operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        waiters.append(W.init(
-                            id: id,
-                            continuation: continuation
-                        ))
+                operation: { [_state] in
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        _state.write { state in
+                            if _state.cancelled {
+                                continuation.resume(throwing: CancellationError())
+                            } else {
+                                state.continuation = continuation
+                                waiters.append(W.init(
+                                    continuation: continuation
+                                ))
+                            }
+                        }
                     }
                 },
-                onCancel: {
-                    Task { await cancel(id: id) }
+                onCancel: { [_state] in
+                    _state.write { state in
+                        state.cancelled = true
+                        state.continuation?.resume(throwing: CancellationError())
+                    }
                 }
             )
         } else {
@@ -101,12 +108,6 @@ public actor ReadWriteLock {
             
             waiters.removeFirst()
             waiter.continuation.resume()
-        }
-    }
-    
-    private func cancel(id: UUID) {
-        if let continuation = waiters.remove(id: id) {
-            continuation.continuation.resume(throwing: CancellationError())
         }
     }
 }

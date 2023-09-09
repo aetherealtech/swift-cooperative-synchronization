@@ -1,22 +1,31 @@
 import Foundation
+import Synchronization
 
 public actor Lock: Lockable {
     public func lock() async throws {
         if locked {
-            let id = UUID()
+            try Task.checkCancellation()
+                    
+            @Synchronization.Synchronized
+            var state: WaiterState = .init()
             
             try await withTaskCancellationHandler(
-                operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        waiters.append(.init(
-                            id: id,
-                            continuation: continuation
-                        ))
+                operation: { [_state] in
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        _state.write { state in
+                            if state.cancelled {
+                                continuation.resume(throwing: CancellationError())
+                            } else {
+                                state.continuation = continuation
+                                waiters.append(continuation)
+                            }
+                        }
                     }
                 },
-                onCancel: {
-                    Task {
-                        await cancel(id: id)
+                onCancel: { [_state] in
+                    _state.write { state in
+                        state.cancelled = true
+                        state.continuation?.resume(throwing: CancellationError())
                     }
                 }
             )
@@ -29,15 +38,9 @@ public actor Lock: Lockable {
         locked = false
         waiters.safelyRemoveFirst()?.resume()
     }
-    
-    private func cancel(id: UUID) {
-        if let continuation = waiters.remove(id: id) {
-            continuation.resume(throwing: CancellationError())
-        }
-    }
-    
+
     private var locked = false
-    private var waiters: [IdentifiableContinuation<Void, Error>] = []
+    private var waiters: [CheckedContinuation<Void, Error>] = []
 }
 
 public extension Lock {

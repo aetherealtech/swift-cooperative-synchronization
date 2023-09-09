@@ -1,4 +1,4 @@
-public protocol Lockable {
+public protocol Lockable: Sendable {
     func lock() async throws
     func unlock() async
     

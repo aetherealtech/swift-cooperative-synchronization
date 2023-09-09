@@ -15,61 +15,29 @@ public actor ConditionVariable {
         }
     }
     
-    public func wait(
-        lock: some Lockable
-    ) async throws {
+    public func wait() async throws {
         try Task.checkCancellation()
-        
-        await lock.unlock()
-        
-        do {
-            let id = UUID()
-            
-            try await withTaskCancellationHandler(
-                operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        waiters.append(.init(
-                            id: id,
-                            continuation: continuation
-                        ))
-                    }
-                },
-                onCancel: {
-                    Task {
-                        await cancel(id: id)
-                    }
-                }
-            )
-            
-            try await lock.lock()
-        } catch {
-            try await lock.lock()
-            throw error
-        }
-    }
-    
-    public func wait(
-        lock: Synchronization.Lock
-    ) async throws {
-        try Task.checkCancellation()
-        
-        lock.unlock()
-        defer { lock.lock() }
-        
-        let id = UUID()
+                
+        @Synchronization.Synchronized
+        var state: WaiterState = .init()
         
         try await withTaskCancellationHandler(
-            operation: {
-                try await withCheckedThrowingContinuation { continuation in
-                    waiters.append(.init(
-                        id: id,
-                        continuation: continuation
-                    ))
+            operation: { [_state] in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    _state.write { state in
+                        if state.cancelled {
+                            continuation.resume(throwing: CancellationError())
+                        } else {
+                            state.continuation = continuation
+                            waiters.append(continuation)
+                        }
+                    }
                 }
             },
-            onCancel: {
-                Task {
-                    await cancel(id: id)
+            onCancel: { [_state] in
+                _state.write { state in
+                    state.cancelled = true
+                    state.continuation?.resume(throwing: CancellationError())
                 }
             }
         )
@@ -87,31 +55,16 @@ public actor ConditionVariable {
         waiters.removeAll()
     }
 
-    private var waiters: [IdentifiableContinuation<Void, Error>] = []
-    
-    private func cancel(id: UUID) {
-        if let continuation = waiters.remove(id: id) {
-            continuation.resume(throwing: CancellationError())
-        }
-    }
+    private var waiters: [CheckedContinuation<Void, Error>] = []
 }
 
 public extension ConditionVariable {
+    nonisolated
     func wait(
-        lock: some Lockable,
-        _ condition: @Sendable () throws -> Bool
+        @_inheritActorContext _ condition: @Sendable () throws -> Bool
     ) async throws {
         while try !condition() {
-            try await wait(lock: lock)
-        }
-    }
-    
-    func wait(
-        lock: Synchronization.Lock,
-        _ condition: @Sendable () throws -> Bool
-    ) async throws {
-        while try !condition() {
-            try await wait(lock: lock)
+            try await wait()
         }
     }
 }

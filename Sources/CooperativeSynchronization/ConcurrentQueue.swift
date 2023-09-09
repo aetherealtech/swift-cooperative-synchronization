@@ -3,18 +3,6 @@ import Combine
 import Foundation
 import Synchronization
 
-fileprivate struct IdentifiableJob: Identifiable {
-    let id: UUID
-    let barrier: Bool
-    let work: @Sendable () async -> Void
-}
-
-fileprivate struct IdentifiableTask: Identifiable {
-    let id: UUID
-    let barrier: Bool
-    let task: Task<Void, Never>
-}
-
 public final class ConcurrentQueue: Scheduler {
     public struct JobConfig: JobConfigProtocol {
         let barrier: Bool
@@ -28,8 +16,11 @@ public final class ConcurrentQueue: Scheduler {
         }
     }
     
-    fileprivate struct State {
-        struct Runner: Identifiable {
+    private typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
+    private typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
+    
+    private final class State: Sendable {
+        final class Runner: Hashable, Sendable {
             enum Mode {
                 case idle
                 case running(IdentifiableTask)
@@ -51,18 +42,29 @@ public final class ConcurrentQueue: Scheduler {
                 }
             }
 
-            let id = UUID()
-            var mode: Mode = .idle
-
-            init(run: @escaping @Sendable (ID) async throws -> Void) {
-                task = .init { [id] in try await run(id) }
+            let _mode: Synchronization.Synchronized<Mode> = .init(wrappedValue: .idle)
+            
+            var mode: Mode {
+                get { _mode.wrappedValue }
+                set { _mode.wrappedValue = newValue }
             }
 
-            func cancel() {
-                task.cancel()
+            init(run: @escaping @Sendable (Runner) async throws -> Void) {
+                Task { try await run(self) }
             }
 
-            private let task: Task<Void, Error>
+            static func == (lhs: Runner, rhs: Runner) -> Bool {
+                lhs === rhs
+            }
+            
+            func hash(into hasher: inout Hasher) {
+                ObjectIdentifier(self).hash(into: &hasher)
+            }
+        }
+        
+        struct State {
+            var runners: Set<Runner> = []
+            var enqueued: [IdentifiableJob] = []
         }
 
         init(maxConcurrency: Int) {
@@ -70,124 +72,112 @@ public final class ConcurrentQueue: Scheduler {
         }
         
         let maxConcurrency: Int
-        var runners: [Runner] = []
-        var enqueued: [IdentifiableJob] = []
+        let _state: Synchronization.Synchronized<State> = .init(wrappedValue: .init())
         
-        mutating func cancelAll() {
-            enqueued.removeAll()
+        func schedule(job: IdentifiableJob) {
+            _state.write { [maxConcurrency] state in
+                state.enqueued.append(job)
 
-            runners
-                .compactMap(\.mode.currentTask)
-                .forEach { $0.task.cancel() }
-        }
-
-        mutating func cancel(id: UUID) {
-            let matchingTask = runners
-                .lazy
-                .compactMap(\.mode.currentTask)
-                .first { $0.id == id }
-
-            if let matchingTask {
-                matchingTask.task.cancel()
-            } else {
-                enqueued.remove(id: id)
+                if state.runners.count < maxConcurrency {
+                    print("ADDING RUNNER")
+                    state.runners.insert(.init(run: run))
+                }
             }
         }
         
-        mutating func nextReadyTask(id: State.Runner.ID) -> IdentifiableTask? {
-            let currentTasks = runners
-                .compactMap(\.mode.currentTask)
-
-            let currentBarrierTask = currentTasks
-                .first(where: \.barrier)
-
-            guard let job = enqueued.first,
-                  currentBarrierTask == nil,
-                  !job.barrier || currentTasks.isEmpty else {
-                runners.remove(id: id)
-                return nil
-            }
-
-            enqueued.removeFirst()
-
-            let task = IdentifiableTask(id: job.id, barrier: job.barrier, task: Task { await job.work() })
-            runners[id: id]?.mode = .running(task)
-
-            return task
-        }
-    }
-
-    private let _state: Synchronization.Synchronized<State>
-
-    private var state: State {
-        get { _state.wrappedValue }
-        set { _state.wrappedValue = newValue }
-    }
-    
-    public init(maxConcurrency: Int = .max) {
-        _state = .init(wrappedValue: .init(
-            maxConcurrency: maxConcurrency
-        ))
-    }
-
-    deinit {
-        _state.write {
-            state in state.cancelAll()
-        }
-    }
-    
-    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
-        let id = UUID()
-        
-        let job = IdentifiableJob(
-            id: id,
-            barrier: config.barrier,
-            work: work
-        )
-
-        _state.write { state in
-            state.enqueued.append(job)
-
-            if state.runners.count < state.maxConcurrency {
-                print("ADDING RUNNER")
-
-                state.runners.append(.init(run: _state.run))
-            }
-        }
-        
-        return .init { [weak _state] in
-            _state?.write { state in
-                state.cancel(id: id)
-            }
-        }
-    }
-
-    public func cancelAll() {
-        _state.write {
-            state in state.cancelAll()
-        }
-    }
-}
-
-extension Synchronization.Synchronized where T == ConcurrentQueue.State {
-    @Sendable
-    func run(id: ConcurrentQueue.State.Runner.ID) async throws {
-        while let task = write({ state in state.nextReadyTask(id: id) }) {
-            try Task.checkCancellation()
-
-            await task.task.value
-
-            write { state in
-                state.runners[id: id]?.mode = .idle
+        func cancelAll() {
+            _state.write { state in
+                state.enqueued.removeAll()
                 
-                if task.barrier, let next = state.enqueued.first {
-                    let count = min(next.barrier ? 1 : state.enqueued.count, state.maxConcurrency - state.runners.count)
+                state.runners
+                    .compactMap(\.mode.currentTask)
+                    .forEach { $0.task.cancel() }
+            }
+        }
+
+        func cancel(id: UUID) {
+            _state.write { state in
+                state.enqueued.remove(id: id)
+                
+                state.runners
+                    .lazy
+                    .compactMap(\.mode.currentTask)
+                    .filter { task in task.id == id }
+                    .forEach { task in task.task.cancel() }
+            }
+        }
+        
+        @Sendable
+        private func run(runner: Runner) async {
+            while let task = nextReadyTask(for: runner) {
+                await task.task.value
+
+                _state.write { [maxConcurrency] state in
+                    runner.mode = .idle
                     
-                    for _ in 0 ..< count {
-                        state.runners.append(.init(run: self.run))
+                    if task.config.barrier, let next = state.enqueued.first {
+                        let count = min(next.config.barrier ? 1 : state.enqueued.count, maxConcurrency - state.runners.count)
+                        
+                        for _ in 0 ..< count {
+                            state.runners.insert(.init(run: run))
+                        }
                     }
                 }
             }
         }
+        
+        private func nextReadyTask(for runner: Runner) -> IdentifiableTask? {
+            _state.write { state in
+                let currentTasks = state.runners
+                    .compactMap(\.mode.currentTask)
+                
+                let currentBarrierTask = currentTasks
+                    .first(where: \.config.barrier)
+                
+                guard let job = state.enqueued.first,
+                      currentBarrierTask == nil,
+                      !job.config.barrier || currentTasks.isEmpty else {
+                    state.runners.remove(runner)
+                    return nil
+                }
+                
+                state.enqueued.removeFirst()
+                
+                let task = job.start()
+                runner.mode = .running(task)
+                
+                return task
+            }
+        }
+    }
+
+    private let state: State
+
+    public init(maxConcurrency: Int = .max) {
+        state = .init(
+            maxConcurrency: maxConcurrency
+        )
+    }
+
+    deinit {
+        state.cancelAll()
+    }
+    
+    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
+        let job = IdentifiableJob(
+            id: .init(),
+            config: config,
+            work: work
+        )
+        
+        state.schedule(job: job)
+
+        return .init { [weak state, id = job.id] in
+            state?.cancel(id: id)
+        }
+    }
+
+    public func cancelAll() {
+        state.cancelAll()
     }
 }

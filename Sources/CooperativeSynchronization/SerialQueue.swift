@@ -1,28 +1,30 @@
+import CollectionExtensions
 import Combine
 import Foundation
 import Synchronization
-
-fileprivate struct IdentifiableJob: Identifiable {
-    let id: UUID
-    let work: @Sendable () async -> Void
-}
-
-fileprivate struct IdentifiableTask: Identifiable {
-    let id: UUID
-    let task: Task<Void, Never>
-}
 
 public final class SerialQueue: Scheduler {
     public struct JobConfig: JobConfigProtocol {
         public init() {}
     }
+    
+    fileprivate typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
+    fileprivate typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
 
-    fileprivate final class State: @unchecked Sendable {
-        var current: IdentifiableTask?
-        var enqueued: [IdentifiableJob] = []
+    fileprivate final class State: Sendable {
+        private struct State {
+            var current: IdentifiableTask?
+            var enqueued: [IdentifiableJob] = []
+        }
         
-        let lock = Synchronization.Lock()
-        let condition = ConditionVariable()
+        private let _state: Synchronization.Synchronized<State> = .init(wrappedValue: .init())
+        
+        private var state: State {
+            get { _state.wrappedValue }
+            set { _state.wrappedValue = newValue}
+        }
+        
+        let condition = AnyConditionVariable<Synchronization.SharedLock>()
         
         @Sendable
         func run() async throws {
@@ -35,31 +37,52 @@ public final class SerialQueue: Scheduler {
             }
         }
         
-        private func startNextJob() async throws -> IdentifiableTask {
-            lock.lock()
-            defer { lock.unlock() }
+        fileprivate func schedule(job: IdentifiableJob) {
+            _state.write { state in
+                state.enqueued.append(job)
+            }
             
-            let job = try await {
-                if let job = enqueued.safelyRemoveFirst() {
+            condition.notifyOne()
+        }
+        
+        func cancel(id: UUID) {
+            _state.write { state in
+                state.enqueued.remove(id: id)
+                
+                if state.current?.id == id {
+                    state.current?.task.cancel()
+                }
+            }
+        }
+        
+        func cancelAll() {
+            _state.write { state in
+                state.current?.task.cancel()
+                state.enqueued.removeAll()
+            }
+        }
+        
+        private func startNextJob() async throws -> IdentifiableTask {
+            let job = {
+                if let job = _state.write({ state in state.enqueued.safelyRemoveFirst() }) {
                     return job
                 } else {
-                    try await condition.wait(lock: lock) {
-                        !enqueued.isEmpty
+                    _state.wait(condition) { state in
+                        !state.enqueued.isEmpty
                     }
                     
-                    return enqueued.removeFirst()
+                    return _state.write { state in state.enqueued.removeFirst() }
                 }
             }()
 
-            let task = IdentifiableTask(id: job.id, task: Task { await job.work() })
-            current = task
+            let task = job.start()
+            _state.write { state in state.current = task }
             
             return task
         }
     }
 
     private let state = State()
-
     private let runner: Task<Void, Error>
 
     public init() {
@@ -71,39 +94,16 @@ public final class SerialQueue: Scheduler {
     }
     
     public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
-        let id = UUID()
+        let job = IdentifiableJob(id: .init(), work: work)
         
-        schedule(id: id, work)
+        state.schedule(job: job)
 
-        return .init { [weak self] in self?.cancel(id: id) }
+        return .init { [weak state, id = job.id] in
+            state?.cancel(id: id)
+        }
     }
 
     public func cancelAll() {
-        state.lock.lock {
-            state.current?.task.cancel()
-            state.enqueued.removeAll()
-        }
-    }
-    
-    func schedule(id: UUID, _ work: @escaping @Sendable () async -> Void) {
-        let job = IdentifiableJob(id: id, work: work)
-
-        state.lock.lock {
-            state.enqueued.append(job)
-        }
-        
-        Task {
-            await state.condition.notifyOne()
-        }
-    }
-
-    func cancel(id: UUID) {
-        state.lock.lock {
-            if state.current?.id == id {
-                state.current?.task.cancel()
-            } else {
-                state.enqueued.remove(id: id)
-            }
-        }
+        state.cancelAll()
     }
 }
