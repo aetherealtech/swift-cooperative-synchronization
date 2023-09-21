@@ -16,10 +16,19 @@ public final class ConcurrentQueue: Scheduler {
         }
     }
     
-    private typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
-    private typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
+    public struct CancelHandle: Cancellable, Sendable {
+        fileprivate weak var state: State?
+        let id: UUID
+        
+        public func cancel() {
+            state?.cancel(id: id)
+        }
+    }
     
-    private final class State: Sendable {
+    fileprivate typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
+    fileprivate typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
+    
+    fileprivate final class State: Sendable {
         final class Runner: Hashable, Sendable {
             enum Mode {
                 case idle
@@ -163,7 +172,7 @@ public final class ConcurrentQueue: Scheduler {
         state.cancelAll()
     }
     
-    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> AnyCancellable {
+    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> CancelHandle {
         let job = IdentifiableJob(
             id: .init(),
             config: config,
@@ -172,9 +181,7 @@ public final class ConcurrentQueue: Scheduler {
         
         state.schedule(job: job)
 
-        return .init { [weak state, id = job.id] in
-            state?.cancel(id: id)
-        }
+        return .init(state: state, id: job.id)
     }
 
     public func cancelAll() {
