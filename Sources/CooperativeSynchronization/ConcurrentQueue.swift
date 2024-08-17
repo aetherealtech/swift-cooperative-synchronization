@@ -91,7 +91,6 @@ public actor ConcurrentQueue: Scheduler {
     private var enqueued: [IdentifiableJob] = []
 
     private func addRunner() {
-        print("ADDING RUNNER")
         let id = UUID()
         runners[id] = .init { await self.run(id: id) }
     }
@@ -142,8 +141,8 @@ public actor ConcurrentQueue: Scheduler {
         runners
             .lazy
             .compactMap(\.value.mode.currentTask)
-            .filter { task in task.id == id }
-            .forEach { task in task.task.cancel() }
+            .first { task in task.id == id }?
+            .task.cancel()
     }
     
 }

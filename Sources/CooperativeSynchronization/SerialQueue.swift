@@ -19,6 +19,10 @@ public actor SerialQueue: Scheduler {
     init() {
         Task(operation: run)
     }
+    
+    deinit {
+        continuation?.resume(throwing: CancellationError())
+    }
 
     public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async throws -> Void) async -> CancelHandle {
         let job = IdentifiableJob(id: .init(), work: work)
@@ -36,8 +40,6 @@ public actor SerialQueue: Scheduler {
     public func cancelAll() {
         enqueued.removeAll()
         current?.task.cancel()
-        continuation?.resume(throwing: CancellationError())
-        continuation = nil
     }
 
     private typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
