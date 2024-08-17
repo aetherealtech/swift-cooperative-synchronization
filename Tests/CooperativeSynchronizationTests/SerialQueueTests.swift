@@ -3,14 +3,13 @@ import XCTest
 @testable import CooperativeSynchronization
 
 import AsyncExtensions
-import Synchronization
+import AsyncCollectionExtensions
 
 final class SerialQueueTests: XCTestCase {
     func testQueue() async throws {
         let queue = SerialQueue()
         
-        @Synchronization.Synchronized
-        var runTimes: [Int: Range<Date>] = [:]
+        let _runTimes = Isolated([:] as [Int: Range<Date>])
         
         let testTask: @Sendable (Int) async -> Void = { [_runTimes] index in
             let start = Date()
@@ -25,19 +24,21 @@ final class SerialQueueTests: XCTestCase {
             
             let end = Date()
             
-            _runTimes.write { runTimes in runTimes[index] = start..<end }
+            await _runTimes.write { runTimes in runTimes[index] = start..<end }
         }
 
-        let tasks: [Task<Void, Never>] = (0..<10).map { index in
-            queue.schedule { await testTask(index) }
+        let tasks: [Task<Void, Never>] = await (0..<10).mapAsync { index in
+            await queue.schedule { await testTask(index) }
         }
-        
+  
         await tasks
             .map { task in { @Sendable in await task.value } }
             .awaitAll()
         
         for index in tasks.indices.dropFirst() {
-            guard let taskRunTime = runTimes[index], let previousTaskRunTime = runTimes[index - 1] else {
+            let (taskRunTime, previousTaskRunTime) = await _runTimes.read { runTimes in (runTimes[index], runTimes[index - 1]) }
+            
+            guard let taskRunTime, let previousTaskRunTime else {
                 XCTFail("Missing task run time")
                 return
             }
@@ -59,8 +60,8 @@ final class SerialQueueTests: XCTestCase {
             }
         }
 
-        let tasks = (0..<10).map { index in
-            queue.schedule { await testTask(index) }
+        let tasks: [Task<Void, Never>] = await (0..<10).mapAsync { index in
+            await queue.schedule { await testTask(index) }
         }
         
         try await Task.sleep(timeInterval: 3)
@@ -83,14 +84,16 @@ final class SerialQueueTests: XCTestCase {
             }
         }
 
-        let tasks = (0..<10).map { index in
-            queue.schedule { await testTask(index) }
+        let tasks = await (0..<10).mapAsync { index in
+            await queue.schedule { await testTask(index) }
         }
         
-        let result = try await queue.schedule { () async -> Int in
+        let finalTask = await queue.schedule { () async -> Int in
             print("Kaboom")
             return 55
-        }.value
+        }
+        
+        let result = try await finalTask.value
         
         print("TEST")
     }
@@ -108,11 +111,11 @@ final class SerialQueueTests: XCTestCase {
             }
         }
 
-        let tasks = (0..<10).map { index in
-            queue.schedule { await testTask(index) }
+        let tasks = await (0..<10).mapAsync { index in
+            await queue.schedule { await testTask(index) }
         }
         
-        let resultTask = queue.schedule { () async -> Int in
+        let resultTask = await queue.schedule { () async -> Int in
             print("Kaboom")
             return 55
         }
@@ -137,11 +140,11 @@ final class SerialQueueTests: XCTestCase {
             }
         }
 
-        let tasks = (0..<10).map { index in
-            queue.schedule { await testTask(index) }
+        let tasks = await (0..<10).mapAsync { index in
+            await queue.schedule { await testTask(index) }
         }
         
-        let resultTask = queue.schedule { () async -> Int in
+        let resultTask = await queue.schedule { () async -> Int in
             print("Kaboom")
             return 55
         }
@@ -158,7 +161,7 @@ final class SerialQueueTests: XCTestCase {
     func testWaitAndCancelAfterSchedule() async throws {
         let queue = SerialQueue()
         
-        let resultTask = queue.schedule { () async -> Int in
+        let resultTask = await queue.schedule { () async -> Int in
             print("STARTING")
             defer { print("FINISHING") }
             

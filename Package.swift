@@ -14,16 +14,16 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(path: "../CoreExtensions"),
-        .package(path: "../Synchronization"),
+        .package(url: "https://github.com/aetherealtech/swift-core-extensions", branch: "master"),
+        .package(url: "https://github.com/aetherealtech/swift-synchronization", branch: "master"),
     ],
     targets: [
         .target(
             name: "CooperativeSynchronization",
             dependencies: [
-                .product(name: "AsyncExtensions", package: "CoreExtensions"),
-                .product(name: "CollectionExtensions", package: "CoreExtensions"),
-                .product(name: "Synchronization", package: "Synchronization"),
+                .product(name: "AsyncExtensions", package: "swift-core-extensions"),
+                .product(name: "CollectionExtensions", package: "swift-core-extensions"),
+                .product(name: "Synchronization", package: "swift-synchronization"),
             ],
             swiftSettings: [.concurrencyChecking(.complete)]
         ),
@@ -31,7 +31,8 @@ let package = Package(
             name: "CooperativeSynchronizationTests",
             dependencies: [
                 "CooperativeSynchronization",
-                .product(name: "AsyncExtensions", package: "CoreExtensions"),
+                .product(name: "AsyncCollectionExtensions", package: "swift-core-extensions"),
+                .product(name: "AsyncExtensions", package: "swift-core-extensions"),
             ],
             swiftSettings: [.concurrencyChecking(.complete)]
         ),

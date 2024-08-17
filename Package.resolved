@@ -1,0 +1,23 @@
+{
+  "pins" : [
+    {
+      "identity" : "swift-core-extensions",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/aetherealtech/swift-core-extensions",
+      "state" : {
+        "branch" : "master",
+        "revision" : "4044889deef6348db134f151187903ffddbd69fc"
+      }
+    },
+    {
+      "identity" : "swift-synchronization",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/aetherealtech/swift-synchronization",
+      "state" : {
+        "branch" : "master",
+        "revision" : "cfb0a9d8c7af5641548c79f965b8d5bcf0219da9"
+      }
+    }
+  ],
+  "version" : 2
+}

@@ -9,24 +9,24 @@ public actor Isolated<Value> {
 }
 
 public extension Isolated {
-    func read<R>(_ work: (Value) throws -> R) rethrows -> R {
+    func read<R: Sendable>(_ work: @Sendable (Value) throws -> R) rethrows -> R {
         try work(value)
     }
     
-    func write<R>(_ work: (inout Value) throws -> R) rethrows -> R {
+    func write<R: Sendable>(_ work: @Sendable (inout Value) throws -> R) rethrows -> R {
         try work(&value)
     }
-
-    func getAndSet(_ work: (inout Value) throws -> Void) rethrows -> Value {
+    
+    func getAndSet(_ work: @Sendable (inout Value) throws -> Void) rethrows -> Value {
         let value = self.value
         try work(&self.value)
         return value
     }
     
     func swap(_ otherValue: inout Value) {
-        otherValue = getAndSet { value in
-            value = otherValue
-        }
+        let value = self.value
+        self.value = otherValue
+        otherValue = value
     }
     
     subscript<Member>(dynamicMember keyPath: KeyPath<Value, Member>) -> Member {

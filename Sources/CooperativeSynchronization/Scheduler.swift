@@ -1,9 +1,8 @@
 import AsyncExtensions
 import Combine
 import Foundation
-import Synchronization
 
-public protocol JobConfigProtocol {
+public protocol JobConfigProtocol: Sendable {
     init()
 }
 
@@ -12,26 +11,20 @@ public protocol Scheduler: Sendable {
     associatedtype CancelHandle: Cancellable & Sendable
     
     @discardableResult
-    func schedule(config: JobConfig, _ work: @escaping @Sendable () async -> Void) -> CancelHandle
+    func schedule(config: JobConfig, _ work: @escaping @Sendable () async throws -> Void) async -> CancelHandle
         
-    func cancelAll()
+    func cancelAll() async
 }
 
 public extension Scheduler {
     @discardableResult
-    func schedule(_ work: @escaping @Sendable () async -> Void) -> CancelHandle {
-        schedule(config: .init(), work)
+    func schedule(_ work: @escaping @Sendable () async throws -> Void) async -> CancelHandle {
+        await schedule(config: .init(), work)
     }
 }
 
-private struct ScheduleWaitState<R, Failure: Error> {
-    var continuation: CheckedContinuation<R, Failure>?
-    var task: AnyCancellable?
-    var cancelled = false
-}
-
-private struct TaskState<Success, Failure: Error> {
-    enum Mode {
+private struct TaskState<Success: Sendable, Failure: Error>: Sendable {
+    enum Mode: Sendable {
         case scheduled
         case running
         case cancelled
@@ -40,6 +33,13 @@ private struct TaskState<Success, Failure: Error> {
     
     var mode: Mode = .scheduled
     var continuation: CheckedContinuation<Success, Failure>?
+    
+    var isScheduled: Bool {
+        switch mode {
+            case .scheduled: return true
+            default: return false
+        }
+    }
     
     var isRunning: Bool {
         switch mode {
@@ -64,24 +64,24 @@ private struct TaskState<Success, Failure: Error> {
 }
 
 public extension Scheduler {
-    func schedule<R>(
+    func schedule<R: Sendable>(
         config: JobConfig = .init(),
-        resultIfCancelled: @escaping @Sendable @autoclosure () -> Result<R, Error> = .failure(CancellationError()),
+        resultIfCancelled: @escaping @Sendable @autoclosure () -> Result<R, any Error> = .failure(CancellationError()),
         _ work: @escaping @Sendable () async throws -> R
-    ) -> Task<R, Error> {
-        .init(operation: scheduleInternal(
+    ) async -> Task<R, any Error> {
+        await .init(operation: scheduleInternal(
             config: config,
             resultIfCancelled: resultIfCancelled(),
             work
         ))
     }
     
-    func schedule<R>(
+    func schedule<R: Sendable>(
         config: JobConfig = .init(),
         resultIfCancelled: @escaping @Sendable @autoclosure () -> R,
         _ work: @escaping @Sendable () async -> R
-    ) -> Task<R, Never> {
-        .init(operation: scheduleInternal(
+    ) async -> Task<R, Never> {
+        await .init(operation: scheduleInternal(
             config: config,
             resultIfCancelled: resultIfCancelled(),
             work
@@ -91,25 +91,25 @@ public extension Scheduler {
     func schedule(
         config: JobConfig = .init(),
         _ work: @escaping @Sendable () async -> Void
-    ) -> Task<Void, Never> {
-        schedule(
+    ) async -> Task<Void, Never> {
+        await schedule(
             config: config,
             resultIfCancelled: (),
             work
         )
     }
 
-    func schedule<R>(
+    func schedule<R: Sendable>(
         config: JobConfig = .init(),
         _ work: @escaping @Sendable () async -> R?
-    ) -> Task<R?, Never> {
-        schedule(
+    ) async -> Task<R?, Never> {
+        await schedule(
             config: config,
             resultIfCancelled: nil, work
         )
     }
 
-    func scheduleAndWait<R>(
+    func scheduleAndWait<R: Sendable>(
         config: JobConfig = .init(),
         resultIfCancelled: @escaping @Sendable @autoclosure () -> R,
         _ work: @escaping @Sendable () async -> R
@@ -121,7 +121,7 @@ public extension Scheduler {
         )()
     }
 
-    func scheduleAndWait<R>(
+    func scheduleAndWait<R: Sendable>(
         config: JobConfig = .init(),
         _ work: @escaping @Sendable () async -> R?
     ) async -> R? {
@@ -140,7 +140,7 @@ public extension Scheduler {
         )
     }
 
-    func scheduleAndWait<R>(
+    func scheduleAndWait<R: Sendable>(
         config: JobConfig = .init(),
         resultIfCancelled: @escaping @Sendable @autoclosure () -> Result<R, Error> = .failure(CancellationError()),
         _ work: @escaping @Sendable () async throws -> R
@@ -152,32 +152,31 @@ public extension Scheduler {
         )()
     }
     
-    private func scheduleInternal<R>(
+    private func scheduleInternal<R: Sendable>(
         config: JobConfig = .init(),
-        resultIfCancelled: @escaping @Sendable @autoclosure () -> Result<R, Error> = .failure(CancellationError()),
+        resultIfCancelled: @escaping @Sendable @autoclosure () -> Result<R, any Error>,
         _ work: @escaping @Sendable () async throws -> R
-    ) -> @Sendable () async throws -> R {
-        @Synchronization.Synchronized
-        var taskState: TaskState<R, Error> = .init()
+    ) async -> @Sendable () async throws -> R {
+        let _taskState = Isolated(TaskState<R, any Error>())
         
-        let cancelHandle = schedule { [_taskState] in
-            guard _taskState.write({ taskState in
-                let cancelled = taskState.isCancelled
+        let cancelHandle = await schedule { [_taskState] in
+            guard await _taskState.write({ taskState in
+                if taskState.isCancelled { return false }
                 taskState.mode = .running
-                return !cancelled
+                return true
             }) else {
                 return
             }
             
-            let result: Result<R, Error> = Task.isCancelled ? resultIfCancelled() : await Result { try await work() }
+            let result: Result<R, any Error> = Task.isCancelled ? resultIfCancelled() : await Result { try await work() }
             
-            _taskState.write { taskState in
+            await _taskState.write { taskState in
                 if let continuation = taskState.continuation {
                     continuation.resume(with: result)
                     taskState.continuation = nil
+                } else {
+                    taskState.mode = .finished(result)
                 }
-                
-                taskState.mode = .finished(result)
             }
         }
                 
@@ -185,62 +184,78 @@ public extension Scheduler {
             try await withTaskCancellationHandler(
                 operation: {
                     try await withCheckedThrowingContinuation { continuation in
-                        _taskState.write { taskState in
-                            if Task.isCancelled && !taskState.isRunning {
-                                cancelHandle.cancel()
-                                taskState.mode = .cancelled
-                                continuation.resume(with: resultIfCancelled())
-                            } else if let result = taskState.result {
-                                continuation.resume(with: result)
-                            } else {
-                                taskState.mode = .scheduled
-                                taskState.continuation = continuation
+                        let cancelled = Task.isCancelled
+                        
+                        Task {
+                            await _taskState.write { taskState in
+                                switch taskState.mode {
+                                    case .scheduled:
+                                        if cancelled {
+                                            cancelHandle.cancel()
+                                            taskState.mode = .cancelled
+                                            continuation.resume(with: resultIfCancelled())
+                                        } else {
+                                            taskState.continuation = continuation
+                                        }
+                                        
+                                    case .running:
+                                        taskState.continuation = continuation
+                                        
+                                    case .cancelled:
+                                        continuation.resume(with: resultIfCancelled())
+                                        
+                                    case let .finished(result):
+                                        continuation.resume(with: result)
+                                }
                             }
                         }
                     }
                 },
                 onCancel: {
-                    _taskState.write { taskState in
-                        cancelHandle.cancel()
-                        
-                        if let continuation = taskState.continuation {
-                            continuation.resume(with: resultIfCancelled())
-                            taskState.continuation = nil
+                    Task {
+                        await _taskState.write { taskState in
+                            cancelHandle.cancel()
+                            
+                            if taskState.isScheduled {
+                                if let continuation = taskState.continuation {
+                                    continuation.resume(with: resultIfCancelled())
+                                    taskState.continuation = nil
+                                } else {
+                                    taskState.mode = .cancelled
+                                }
+                            }
                         }
-                        
-                        taskState.mode = .cancelled
                     }
                 }
             )
         }
     }
     
-    func scheduleInternal<R>(
+    private func scheduleInternal<R: Sendable>(
         config: JobConfig = .init(),
         resultIfCancelled: @escaping @Sendable @autoclosure () -> R,
         _ work: @escaping @Sendable () async -> R
-    ) -> @Sendable () async -> R {
-        @Synchronization.Synchronized
-        var taskState: TaskState<R, Never> = .init()
+    ) async -> @Sendable () async -> R {
+        let _taskState = Isolated(TaskState<R, Never>())
         
-        let cancelHandle = schedule { [_taskState] in
-            guard _taskState.write({ taskState in
-                let cancelled = taskState.isCancelled
+        let cancelHandle = await schedule { [_taskState] in
+            guard await _taskState.write({ taskState in
+                if taskState.isCancelled { return false }
                 taskState.mode = .running
-                return !cancelled
+                return true
             }) else {
                 return
             }
             
             let result = Task.isCancelled ? resultIfCancelled() : await work()
             
-            _taskState.write { taskState in
+            await _taskState.write { taskState in
                 if let continuation = taskState.continuation {
                     continuation.resume(returning: result)
                     taskState.continuation = nil
+                } else {
+                    taskState.mode = .finished(.success(result))
                 }
-                
-                taskState.mode = .finished(.success(result))
             }
         }
                 
@@ -248,30 +263,47 @@ public extension Scheduler {
             await withTaskCancellationHandler(
                 operation: {
                     await withCheckedContinuation { continuation in
-                        _taskState.write { taskState in
-                            if Task.isCancelled && !taskState.isRunning {
-                                cancelHandle.cancel()
-                                taskState.mode = .cancelled
-                                continuation.resume(returning: resultIfCancelled())
-                            } else if let result = taskState.result {
-                                continuation.resume(with: result)
-                            } else {
-                                taskState.mode = .scheduled
-                                taskState.continuation = continuation
+                        let cancelled = Task.isCancelled
+                        
+                        Task {
+                            await _taskState.write { taskState in
+                                switch taskState.mode {
+                                    case .scheduled:
+                                        if cancelled {
+                                            cancelHandle.cancel()
+                                            taskState.mode = .cancelled
+                                            continuation.resume(returning: resultIfCancelled())
+                                        } else {
+                                            taskState.continuation = continuation
+                                        }
+                                        
+                                    case .running:
+                                        taskState.continuation = continuation
+                                        
+                                    case .cancelled:
+                                        continuation.resume(returning: resultIfCancelled())
+                                        
+                                    case let .finished(result):
+                                        continuation.resume(with: result)
+                                }
                             }
                         }
                     }
                 },
                 onCancel: {
-                    _taskState.write { taskState in
-                        cancelHandle.cancel()
-
-                        if let continuation = taskState.continuation {
-                            continuation.resume(returning: resultIfCancelled())
-                            taskState.continuation = nil
+                    Task {
+                        await _taskState.write { taskState in
+                            cancelHandle.cancel()
+                            
+                            if taskState.isScheduled {
+                                if let continuation = taskState.continuation {
+                                    continuation.resume(returning: resultIfCancelled())
+                                    taskState.continuation = nil
+                                } else {
+                                    taskState.mode = .cancelled
+                                }
+                            }
                         }
-                        
-                        taskState.mode = .cancelled
                     }
                 }
             )
@@ -301,7 +333,7 @@ public struct DefaultScheduler: Scheduler {
     }
 
     @discardableResult
-    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async throws -> Void) -> Task<Void, Error> {
         .init(priority: config.priority ?? defaultPriority, operation: work)
     }
 

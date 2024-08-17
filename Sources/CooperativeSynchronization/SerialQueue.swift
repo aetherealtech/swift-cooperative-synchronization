@@ -1,116 +1,84 @@
 import CollectionExtensions
 import Combine
 import Foundation
-import Synchronization
 
-public final class SerialQueue: Scheduler {
+public actor SerialQueue: Scheduler {
     public struct JobConfig: JobConfigProtocol {
         public init() {}
     }
     
     public struct CancelHandle: Cancellable, Sendable {
-        fileprivate weak var state: State?
+        let queue: SerialQueue
         let id: UUID
-        
+
         public func cancel() {
-            state?.cancel(id: id)
-        }
-    }
-    
-    fileprivate typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
-    fileprivate typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
-
-    fileprivate final class State: Sendable {
-        private struct State {
-            var current: IdentifiableTask?
-            var enqueued: [IdentifiableJob] = []
-        }
-        
-        private let _state: Synchronization.Synchronized<State> = .init(wrappedValue: .init())
-        
-        private var state: State {
-            get { _state.wrappedValue }
-            set { _state.wrappedValue = newValue}
-        }
-        
-        let condition = AnyConditionVariable<Synchronization.SharedLock>()
-        
-        @Sendable
-        func run() async throws {
-            while true {
-                try Task.checkCancellation()
-                
-                let task = try await startNextJob()
-                
-                await task.task.value
-            }
-        }
-        
-        fileprivate func schedule(job: IdentifiableJob) {
-            _state.write { state in
-                state.enqueued.append(job)
-            }
-            
-            condition.notifyOne()
-        }
-        
-        func cancel(id: UUID) {
-            _state.write { state in
-                state.enqueued.remove(id: id)
-                
-                if state.current?.id == id {
-                    state.current?.task.cancel()
-                }
-            }
-        }
-        
-        func cancelAll() {
-            _state.write { state in
-                state.current?.task.cancel()
-                state.enqueued.removeAll()
-            }
-        }
-        
-        private func startNextJob() async throws -> IdentifiableTask {
-            let job = {
-                if let job = _state.write({ state in state.enqueued.safelyRemoveFirst() }) {
-                    return job
-                } else {
-                    _state.wait(condition) { state in
-                        !state.enqueued.isEmpty
-                    }
-                    
-                    return _state.write { state in state.enqueued.removeFirst() }
-                }
-            }()
-
-            let task = job.start()
-            _state.write { state in state.current = task }
-            
-            return task
+            Task { await queue.cancel(id: id) }
         }
     }
 
-    private let state = State()
-    private let runner: Task<Void, Error>
-
-    public init() {
-        runner = Task(operation: state.run)
+    init() {
+        Task(operation: run)
     }
 
-    deinit {
-        cancelAll()
-    }
-    
-    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async -> Void) -> CancelHandle {
+    public func schedule(config: JobConfig = .init(), _ work: @escaping @Sendable () async throws -> Void) async -> CancelHandle {
         let job = IdentifiableJob(id: .init(), work: work)
         
-        state.schedule(job: job)
-
-        return .init(state: state, id: job.id)
+        if let continuation {
+            continuation.resume(returning: job)
+            self.continuation = nil
+        } else {
+            enqueued.append(job)
+        }
+        
+        return .init(queue: self, id: job.id)
     }
 
     public func cancelAll() {
-        state.cancelAll()
+        enqueued.removeAll()
+        current?.task.cancel()
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
+    }
+
+    private typealias IdentifiableJob = CooperativeSynchronization.IdentifiableJob<JobConfig>
+    private typealias IdentifiableTask = CooperativeSynchronization.IdentifiableTask<JobConfig>
+            
+    private var current: IdentifiableTask?
+    private var enqueued: [IdentifiableJob] = []
+    
+    private var continuation: CheckedContinuation<IdentifiableJob, any Error>?
+    
+    @Sendable
+    private nonisolated func run() async throws {
+        while true {
+            let task = try await startNextJob()
+            
+            try? await task.task.value
+        }
+    }
+
+    private func cancel(id: UUID) {
+        enqueued.remove(id: id)
+        
+        if current?.id == id {
+            current?.task.cancel()
+        }
+    }
+    
+    private func startNextJob() async throws -> IdentifiableTask {
+        let job = try await {
+            if let job = enqueued.safelyRemoveFirst() {
+                return job
+            } else {
+                return try await withCheckedThrowingContinuation { continuation in
+                    self.continuation = continuation
+                }
+            }
+        }()
+        
+        let task = job.start()
+        current = task
+        
+        return task
     }
 }

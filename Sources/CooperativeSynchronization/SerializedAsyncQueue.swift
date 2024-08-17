@@ -7,112 +7,160 @@ import Foundation
  Unlike AsyncQueue, SerializedAsyncQueue is not an AsyncSequence, and thus cannot be for awaited... over.  This is because it is only safe to remove an item from the serialized copy of the queue after an item is successfully processed.  A special API is provided to allow asynchronous processing that ensures an item is only removed once processing of that item completes successfully.  That way, if the app is terminated in the middle of processing an item, then that item will still exist as the first item in the queue on a new app session.
  */
 
-public actor SerializedAsyncQueue<Element: Codable & Sendable, Decoder: TopLevelDecoder, Encoder: TopLevelEncoder> where Decoder.Input == Data, Encoder.Output == Data {
-    public var currentElements: [Element] {
-        loadQueue
-            .map(\.element)
-    }
+//public protocol SerializableTask: Codable, Sendable {
+//    associatedtype Success
+//
+//
+//
+//    var value:
+//}
+//
+//public protocol SerializableThrowingTask: Codable, Sendable {
+//    associatedtype Success
+//}
 
+public final class SerializedAsyncQueue<
+    Memento: Sendable & Identifiable,
+    Scheduler: CooperativeSynchronization.Scheduler
+>: @unchecked Sendable {
     public init(
-        url: URL,
+        load: @escaping @Sendable () -> [Memento],
+        save: @escaping @Sendable ([Memento]) -> Void,
+        lock: ReadWriteLock,
+        taskFactory: @escaping @Sendable (Memento) -> @Sendable () async -> Void,
+        scheduler: Scheduler
+    ) async {
+        self.load = load
+        self.save = save
+        self.lock = lock
+        self.taskFactory = taskFactory
+        self.scheduler = scheduler
+        
+        await lock.read {
+            let values = load()
+            print("---- Queue count: \(values.count) -----")
+
+            for value in values {
+                schedule(value: value)
+            }
+        }
+    }
+    
+    func append(_ value: Memento) async {
+        await lock.write {
+            print("---- appending to Queue -----")
+            var values = load()
+            values.append(value)
+            print("---- Queue count: \(values.count) -----")
+            save(values)
+            
+            schedule(value: value)
+        }
+    }
+    
+    func clearQueue() async {
+        await lock.write {
+            save([])
+            queued.forEach { $1.cancel() }
+        }
+    }
+    
+    private func schedule(value: Memento) {
+        queued[value.id] = Task { await scheduler.schedule(process(value: value)) }
+    }
+    
+    private func process(value: Memento) -> @Sendable () async -> Void {
+        let work = taskFactory(value)
+        
+        return {
+            await work()
+            
+            await self.lock.write {
+                var values = self.load()
+                print("---- Queue count after processing: \(values.count) -----")
+                values.removeAll { $0.id == value.id }
+                self.save(values)
+                self.queued[value.id] = nil
+            }
+        }
+    }
+    
+    private let load: () -> [Memento]
+    private let save: ([Memento]) -> Void
+    private let lock: ReadWriteLock
+    private let taskFactory: @Sendable (Memento) -> @Sendable () async -> Void
+    private let scheduler: Scheduler
+    
+    private var queued: [Memento.ID: Task<Scheduler.CancelHandle, Never>] = [:]
+}
+
+extension Task where Success: Cancellable, Failure == Never {
+    func deepCancel() {
+        cancel()
+        Task<Void, Never> { await self.value.cancel() }
+    }
+}
+
+public extension SerializedAsyncQueue {
+    convenience init<
+        Decoder: TopLevelDecoder & Sendable,
+        Encoder: TopLevelEncoder & Sendable
+    > (
+        load: @escaping @Sendable () throws -> Decoder.Input,
+        save: @escaping @Sendable (Encoder.Output) throws -> Void,
+        lock: ReadWriteLock,
+        taskFactory: @escaping @Sendable (Memento) -> @Sendable () async -> Void,
+        scheduler: Scheduler,
         decoder: Decoder,
         encoder: Encoder,
-        onDecodeError: @escaping (Error) -> Void,
-        onEncodeError: @escaping (Error) -> Void
-    ) {
-        self.url = url
-        self.decoder = decoder
-        self.encoder = encoder
-        
-        self.onDecodeError = onDecodeError
-        self.onEncodeError = onEncodeError
-    }
-
-    public func process(_ handler: @escaping @Sendable (Element) async -> Void) async {
-        while true {
-            let value = await withCheckedContinuation { incomingContinuation in
-                let values = loadQueue
-                print("---- Queue count processing: \(values.count) -----")
-
-                guard let value = values.first else {
-                    continuation = (incomingContinuation, handler)
-                    return
+        onLoadError: @escaping @Sendable (Error) -> Void,
+        onSaveError: @escaping @Sendable (Error) -> Void
+    ) async where Memento: Codable, Decoder.Input == Encoder.Output {
+        await self.init(
+            load: {
+                do {
+                    return try decoder.decode([Memento].self, from: try load())
+                } catch {
+                    onLoadError(error)
+                    return []
                 }
-
-                currentTask = Task { await handler(value.element) }
-
-                incomingContinuation.resume(returning: value)
-            }
-
-            _ = await currentTask?.value
-
-            var values = loadQueue
-            print("---- Queue count after processing: \(values.count) -----")
-            values.removeAll(of: value)
-            saveQueue(values)
-            currentTask = nil
-        }
-    }
-
-    public func append(element: Element) {
-        print("---- appending to Queue -----")
-        var values = loadQueue
-        let queuedElement = QueuedElement(element: element)
-        values.append(queuedElement)
-        print("---- Queue count: \(values.count) -----")
-        saveQueue(values)
-
-        if let (continuation, handler) = continuation {
-            currentTask = Task { await handler(element) }
-            continuation.resume(returning: queuedElement)
-            self.continuation = nil
-        }
-    }
-
-    public func clearQueue() {
-        saveQueue([])
-        currentTask?.cancel()
-        currentTask = nil
+            },
+            save: { queue in
+                do {
+                    try save(encoder.encode(queue))
+                } catch {
+                    onSaveError(error)
+                }
+            },
+            lock: lock,
+            taskFactory: taskFactory,
+            scheduler: scheduler
+        )
     }
     
-    private struct QueuedElement: Codable, Equatable, Sendable {
-        let id: UUID
-        let element: Element
-
-        init(element: Element) {
-            id = .init()
-            self.element = element
-        }
-
-        static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.id == rhs.id
-        }
-    }
-    
-    private let url: URL
-    private let decoder: Decoder
-    private let encoder: Encoder
-    
-    private let onDecodeError: (Error) -> Void
-    private let onEncodeError: (Error) -> Void
-
-    private var continuation: (CheckedContinuation<QueuedElement, Never>, @Sendable (Element) async -> Void)?
-    private var currentTask: Task<Void, Never>?
-
-    private var loadQueue: [QueuedElement] {
-        do {
-            return try decoder.decode([QueuedElement].self, from: try .init(contentsOf: url))
-        } catch {
-            onDecodeError(error)
-            return []
-        }
-    }
-
-    private func saveQueue(_ elements: [QueuedElement]) {
-        do {
-            try encoder.encode(elements).write(to: url)
-        } catch {
-            onEncodeError(error)
-        }
+    convenience init<
+        Decoder: TopLevelDecoder & Sendable,
+        Encoder: TopLevelEncoder & Sendable
+    > (
+        url: URL,
+        lock: ReadWriteLock = .init(),
+        taskFactory: @escaping @Sendable (Memento) -> @Sendable () async -> Void,
+        scheduler: Scheduler,
+        decoder: Decoder,
+        encoder: Encoder,
+        onLoadError: @escaping @Sendable (Error) -> Void,
+        onSaveError: @escaping @Sendable (Error) -> Void
+    ) async where Memento: Codable, Decoder.Input == Data, Encoder.Output == Data {
+        await self.init(
+            load: { try Data(contentsOf: url) },
+            save: { data in try data.write(to: url) },
+            lock: lock,
+            taskFactory: taskFactory,
+            scheduler: scheduler,
+            decoder: decoder,
+            encoder: encoder,
+            onLoadError: onLoadError,
+            onSaveError: onSaveError
+        )
     }
 }

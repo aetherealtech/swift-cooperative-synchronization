@@ -3,12 +3,12 @@ import Foundation
 struct IdentifiableJob<Config: JobConfigProtocol>: Identifiable {
     let id: UUID
     let config: Config
-    let work: @Sendable () async -> Void
+    let work: @Sendable () async throws -> Void
     
     init(
         id: UUID,
         config: Config = .init(),
-        work: @escaping @Sendable () async -> Void
+        work: @escaping @Sendable () async throws -> Void
     ) {
         self.id = id
         self.config = config
@@ -24,8 +24,8 @@ struct IdentifiableJob<Config: JobConfigProtocol>: Identifiable {
     }
 }
 
-struct IdentifiableTask<Config: JobConfigProtocol>: Identifiable {
+struct IdentifiableTask<Config: JobConfigProtocol>: Identifiable, Sendable {
     let id: UUID
     let config: Config
-    let task: Task<Void, Never>
+    let task: Task<Void, Error>
 }

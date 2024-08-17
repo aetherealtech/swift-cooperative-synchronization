@@ -6,11 +6,11 @@ public final class Synchronized<Value: Sendable>: @unchecked Sendable {
     }
     
     public var value: Value {
-        get async throws { try await lock.read { _value } }
+        get async { await lock.read { _value } }
     }
     
-    public func set(_ newValue: Value) async throws {
-        try await lock.write { _value = newValue }
+    public func set(_ newValue: Value) async {
+        await lock.write { _value = newValue }
     }
     
     let lock = ReadWriteLock()
@@ -18,19 +18,19 @@ public final class Synchronized<Value: Sendable>: @unchecked Sendable {
 }
 
 public extension Synchronized {
-    func read<R: Sendable>(_ work: @Sendable (Value) async throws -> R) async throws -> R {
+    func read<R: Sendable>(_ work: @Sendable (Value) async throws -> R) async rethrows -> R {
         try await lock.read {
             try await work(_value)
         }
     }
     
-    func write<R: Sendable>(_ work: @Sendable (inout Value) async throws -> R) async throws -> R {
+    func write<R: Sendable>(_ work: @Sendable (inout Value) async throws -> R) async rethrows -> R {
         try await lock.write {
             try await work(&_value)
         }
     }
-
-    func getAndSet(_ work: @Sendable (inout Value) async throws -> Void) async throws -> Value {
+    
+    func getAndSet(_ work: @Sendable (inout Value) async throws -> Void) async rethrows -> Value {
         try await lock.write {
             let value = _value
             try await work(&_value)
@@ -38,18 +38,18 @@ public extension Synchronized {
         }
     }
     
-    func swap(_ otherValue: inout Value) async throws {
-        otherValue = try await getAndSet { [otherValue] value in
+    func swap(_ otherValue: inout Value) async {
+        otherValue = await getAndSet { [otherValue] value in
             value = otherValue
         }
     }
     
     subscript<Member: Sendable>(dynamicMember keyPath: KeyPath<Value, Member>) -> Member {
-        get async throws { try await read { value in value[keyPath: keyPath] } }
+        get async { await read { value in value[keyPath: keyPath] } }
     }
     
-    func set<Member: Sendable>(member keyPath: WritableKeyPath<Value, Member>, to newValue: Member) async throws {
-        try await write { value in value[keyPath: keyPath] = newValue }
+    func set<Member: Sendable>(member keyPath: WritableKeyPath<Value, Member>, to newValue: Member) async {
+        await write { value in value[keyPath: keyPath] = newValue }
     }
 }
 
