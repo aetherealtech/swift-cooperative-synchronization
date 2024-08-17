@@ -59,9 +59,13 @@ public final class SerializedAsyncQueue<
     }
     
     func clearQueue() async {
-        await lock.write {
+        let queued = await lock.write {
             save([])
-            queued.forEach { $1.cancel() }
+            return Array(self.queued.values)
+        }
+        
+        for queuedTask in queued {
+            await queuedTask.value.cancel()
         }
     }
     
@@ -92,13 +96,6 @@ public final class SerializedAsyncQueue<
     private let scheduler: Scheduler
     
     private var queued: [Memento.ID: Task<Scheduler.CancelHandle, Never>] = [:]
-}
-
-extension Task where Success: Cancellable, Failure == Never {
-    func deepCancel() {
-        cancel()
-        Task<Void, Never> { await self.value.cancel() }
-    }
 }
 
 public extension SerializedAsyncQueue {

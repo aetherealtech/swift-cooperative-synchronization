@@ -14,6 +14,7 @@ let package = Package(
         ),
     ],
     dependencies: [
+        .package(url: "https://github.com/aetherealtech/swift-assertions", branch: "master"),
         .package(url: "https://github.com/aetherealtech/swift-core-extensions", branch: "master"),
         .package(url: "https://github.com/aetherealtech/swift-synchronization", branch: "master"),
     ],
@@ -31,6 +32,7 @@ let package = Package(
             name: "CooperativeSynchronizationTests",
             dependencies: [
                 "CooperativeSynchronization",
+                .product(name: "Assertions", package: "swift-assertions"),
                 .product(name: "AsyncCollectionExtensions", package: "swift-core-extensions"),
                 .product(name: "AsyncExtensions", package: "swift-core-extensions"),
             ],

@@ -5,8 +5,8 @@ public actor ReadWriteLock {
         self.maxReaders = maxReaders
     }
     
-    public func lock() async {
-        await lock(
+    public func lock() -> Task<Void, Never> {
+        lock(
             ready: readers < maxReaders && !writing && waiters.lazy.filter { $0.type == .writer }.isEmpty,
             acquire: { readers += 1 },
             waiterType: .reader
@@ -23,8 +23,8 @@ public actor ReadWriteLock {
         notify()
     }
     
-    public func exclusiveLock() async {
-        await lock(
+    public func exclusiveLock() -> Task<Void, Never> {
+        lock(
             ready: readers == 0 && !writing && waiters.isEmpty,
             acquire: { writing = true },
             waiterType: .writer
@@ -37,8 +37,10 @@ public actor ReadWriteLock {
             case writer
         }
         
+        let id = UUID()
         let type: WaiterType
-        let continuation: CheckedContinuation<Void, Never>
+        var continuation: CheckedContinuation<Void, Never>?
+        var notified = false
     }
     
     private let maxReaders: Int
@@ -52,16 +54,28 @@ public actor ReadWriteLock {
         ready: Bool,
         acquire: () -> Void,
         waiterType: Waiter.WaiterType
-    ) async {
+    ) -> Task<Void, Never> {
         if !ready {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                waiters.append(Waiter(
-                    type: waiterType,
-                    continuation: continuation
-                ))
+            let waiter = Waiter(type: waiterType)
+            waiters.append(waiter)
+            let id = waiter.id
+            
+            return .init {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    let waiterIndex = waiters.firstIndex { $0.id == id }!
+                    
+                    if waiters[waiterIndex].notified {
+                        continuation.resume()
+                        waiters.remove(at: waiterIndex)
+                    } else {
+                        waiters[waiterIndex].continuation = continuation
+                    }
+                }
             }
         } else {
             acquire()
+            
+            return .init {}
         }
     }
     
@@ -81,22 +95,74 @@ public actor ReadWriteLock {
             
             guard ready else { break }
             
-            waiters.removeFirst()
-            waiter.continuation.resume()
+            if let continuation = waiter.continuation {
+                continuation.resume()
+                waiters.removeFirst()
+            } else {
+                waiters[0].notified = true
+            }
         }
     }
 }
 
 public extension ReadWriteLock {
+    func scheduleRead<R: Sendable>(_ work: @escaping @Sendable () async -> R) -> Task<R, Never> {
+        let locked = lock()
+        
+        return .init {
+            defer { unlock() }
+            
+            await locked.value
+            
+            return await work()
+        }
+    }
+    
+    func scheduleRead<R: Sendable>(_ work: @escaping @Sendable () async throws -> R) -> Task<R, any Error> {
+        let locked = lock()
+        
+        return .init {
+            defer { unlock() }
+            
+            await locked.value
+            
+            return try await work()
+        }
+    }
+    
+    func scheduleWrite<R: Sendable>(_ work: @escaping @Sendable () async -> R) -> Task<R, Never> {
+        let locked = exclusiveLock()
+        
+        return .init {
+            defer { unlock() }
+            
+            await locked.value
+            
+            return await work()
+        }
+    }
+    
+    func scheduleWrite<R: Sendable>(_ work: @escaping @Sendable () async throws -> R) -> Task<R, any Error> {
+        let locked = exclusiveLock()
+        
+        return .init {
+            defer { unlock() }
+            
+            await locked.value
+            
+            return try await work()
+        }
+    }
+
     func read<R: Sendable>(_ work: @Sendable () async throws -> R) async rethrows -> R {
-        await lock()
+        await lock().value
         defer { unlock() }
         
         return try await work()
     }
     
     func write<R: Sendable>(_ work: @Sendable () async throws -> R) async rethrows -> R {
-        await exclusiveLock()
+        await exclusiveLock().value
         defer { unlock() }
         
         return try await work()
@@ -106,7 +172,7 @@ public extension ReadWriteLock {
 public struct SharedLock: Lockable {
     let lock: ReadWriteLock
     
-    public func lock() async { await lock.lock() }
+    public func lock() async -> Task<Void, Never> { await lock.lock() }
     public func unlock() async { await lock.unlock() }
     
     public func lock<R: Sendable>(_ work: @Sendable () async throws -> R) async rethrows -> R {
@@ -117,7 +183,7 @@ public struct SharedLock: Lockable {
 public struct ExclusiveLock: Lockable {
     let lock: ReadWriteLock
     
-    public func lock() async { await lock.exclusiveLock() }
+    public func lock() async -> Task<Void, Never> { await lock.exclusiveLock() }
     public func unlock() async { await lock.unlock() }
     
     public func lock<R: Sendable>(_ work: @Sendable () async throws -> R) async rethrows -> R {
