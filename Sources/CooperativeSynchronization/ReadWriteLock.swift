@@ -7,7 +7,7 @@ public actor ReadWriteLock {
     
     public func lock() async {
         await lock(
-            ready: readers < maxReaders && !writing,
+            ready: readers < maxReaders && !writing && waiters.lazy.filter { $0.type == .writer }.isEmpty,
             acquire: { readers += 1 },
             waiterType: .reader
         )
@@ -25,7 +25,7 @@ public actor ReadWriteLock {
     
     public func exclusiveLock() async {
         await lock(
-            ready: readers == 0 && !writing,
+            ready: readers == 0 && !writing && waiters.isEmpty,
             acquire: { writing = true },
             waiterType: .writer
         )
@@ -46,18 +46,14 @@ public actor ReadWriteLock {
     private var readers = 0
     private var writing = false
 
-    private var waiters: [Waiter] = [] {
-        didSet {
-            print("WAITERS: \(waiters)")
-        }
-    }
+    private var waiters: [Waiter] = []
     
     private func lock(
         ready: Bool,
         acquire: () -> Void,
         waiterType: Waiter.WaiterType
     ) async {
-        if !ready || !waiters.lazy.filter({ $0.type == waiterType }).isEmpty {
+        if !ready {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 waiters.append(Waiter(
                     type: waiterType,
@@ -73,12 +69,12 @@ public actor ReadWriteLock {
         while let waiter = waiters.first {
             let ready = { switch waiter.type {
                 case .writer:
-                    guard !writing && readers == 0 else { return false }
+                    guard readers == 0 && !writing else { return false }
                     writing = true
                     return true
                     
                 case .reader:
-                    guard !writing && readers < maxReaders else { return false }
+                    guard readers < maxReaders && !writing else { return false }
                     readers += 1
                     return true
             } }()
